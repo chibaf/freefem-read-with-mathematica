@@ -31,6 +31,7 @@ mesh Th2=buildmesh(D1(10) + D2(40) + D3(10) + D4(40));
 mesh Th=Th1+Th2;
 savemesh(Th, "yunomi.msh");
 savemesh(Th1, "yunomi1.msh");
+plot(Th1,wait=1);
 
 int regMain   = Th1(rpipe + 0.01, H/2.0).region;       
 int regShroud = Th1(d + w1/2.0, S + H1/2.0).region;   
