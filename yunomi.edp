@@ -1,0 +1,163 @@
+// uzawaunomi_260513A.edp
+// 境界条件のベクトル化による、中心軸駆動ストークス流れの計算
+// Mesh; shroud is void (out of space/system)
+// Stokes equation is solved
+// setting flow velocity on center axis
+//       center line (pipe surface)
+// --- 1. メッシュ作成 ---
+load "iovtk"   // for paraview
+//
+real w = 0.25;      // 原子炉容器半径
+real H = 0.8;       // 原子炉容器高さ
+real S = 0.1;       // シュラウド下端
+real H1 = 0.6;      // シュラウド高さ
+real d = 0.15;      // シュラウド内径
+real w1 = 0.03;     // シュラウド厚み
+real rpipe = 0.02;  // 中心軸回避用パイプ半径
+real d2 = 0.025;    // frozen wall
+
+border C1(t=rpipe, w-d2) {x=t; y=d2; label=1;}
+border C2(t=d2, H){x=w-d2; y=t; label=2;}
+border C3(t=w-d2,rpipe){x=t; y=H; label=3;}
+border Cpipe(t=H,d2){x=rpipe; y=t; label=12;}
+
+border D1(t=-pi,0){x=d+w1/2.0 + (w1/2.0)*cos(t); y=S + (w1/2.0)*sin(t); label=21;}  // シュラウド下端
+border D2(t=S, S+H1) {x=d+w1; y=t; label=22;}  // シュラウド外壁
+border D3(t=0, pi) {x=d+w1/2.0 + (w1/2.0)*cos(t); y=S+H1 + (w1/2.0)*sin(t); label=23;}  // シュラウド上端
+border D4(t=S+H1, S) {x=d; y=t; label=24;}  // シュラウド内壁
+
+mesh Th1 = buildmesh(C1(20) + C2(80) + C3(20) + Cpipe(80) + D1(-10) + D2(-40) + D3(-10) + D4(-40));
+mesh Th2=buildmesh(D1(10) + D2(40) + D3(10) + D4(40));
+mesh Th=Th1+Th2;
+savemesh(Th, "yunomi.msh");
+savemesh(Th1, "yunomi1.msh");
+
+int regMain   = Th1(rpipe + 0.01, H/2.0).region;       
+int regShroud = Th1(d + w1/2.0, S + H1/2.0).region;   
+
+fespace Ph(Th1, P0);
+fespace Vh(Th1, P2), Qh(Th1, P1);
+Vh u=0, v=0, uu, vv, up, vp;
+Qh p=0, pp,ppp;
+//Vh u, v;
+Ph field;
+
+
+
+// --- 2. 有限要素空間の定義 ---
+fespace Xh(Th1, P2);
+Xh u1, u2;      // 半径方向流速(u1), 軸方向流速(u2)
+Xh v1;          // テスト関数（共通で利用）
+Xh bc1, bc2;    // 境界条件ベクトル
+Xh b;           // 右辺ベクトル計算用
+real Vpump = 5.0;           //強制流速 [m/s]
+
+Xh fP = ( (x >= rpipe && x < d) && (y >= S+H1*0.05 && y <= S+H1*0.15) ) ? Vpump : 0.0;
+
+// 積分形式でベクトル化（pumpからの力を積分して加算）=int2d(Th)( fP * v )
+varf vSource(u, v) = int2d(Th)( fP * v ); 
+real[int] fPvec = vSource(0, Xh); // ここで各節点への「配分量」が計算される
+
+fespace Mh(Th1, P1);
+//Mh p, ppp;      // 圧力(p), 作業用圧力(ppp)
+
+// --- 3. 変分形式の定義（公式のUzawa法に準拠） ---
+
+// 行列 A に最初からDirichlet境界条件（u=0）を含めて組み立てる
+// ※Uzawa法では、速度の境界条件が「斉次（=0）」であれば、行列に含めるだけで右辺の処理が極めてシンプルになります。
+varf vA1(u, v) = int2d(Th1)( dx(u)*dx(v) + dy(u)*dy(v) ) 
+               + on(1, 2, 3, 12, 22, 24, 21, 23, u=0); // u1用（全ての壁で0）
+
+varf vA2(u, v) = int2d(Th1)( dx(u)*dx(v) + dy(u)*dy(v) ) 
+               + on(1, 2, 3, 22, u=0);         // u2用（Cpipe=12 と シュラウドの壁=24 21 23 以外で0）
+
+matrix A1 = vA1(Xh, Xh, solver=CG); 
+matrix A2 = vA2(Xh, Xh, solver=CG); 
+
+// B行列（発散/勾配項）
+varf vbx (u, q) = int2d(Th1)( -(dx(u)*q) );
+varf vby (u, q) = int2d(Th1)( -(dy(u)*q) );
+matrix Bx = vbx(Xh, Mh);
+matrix By = vby(Xh, Mh);
+
+// --- 5. Uzawa法の反復関数 ---
+func real[int] divup (real[int] & pp){
+    // 1. x成分 u1 の計算
+    // 右辺の組み立て：Bの転置 × 圧力
+    // ※境界条件(u=0)を正しく処理するため、varfをベースとした右辺計算、
+    // もしくは境界節点を0にリセットする処理が必要ですが、
+    // 最も確実なのは、FreeFEMの「varfの第1引数を0にした形式」です。
+    
+    varf vRHS1(u, v) = int2d(Th1)( ppp * dx(v) ) + on(1, 2, 3, 12, 22, 24, 21, 23, u=0);
+    // ※ Bx'*pp の計算を、圧力を関数pppに移して変分形式で計算（境界条件の整合性を保つため）
+    ppp[] = pp; // 引数の配列をMh空間の関数にコピー
+    
+    real[int] b1 = vRHS1(0, Xh);
+    u1[] = A1^-1 * b1;
+
+    // 2. y成分 u2 の計算
+    varf vRHS2(u, v) = int2d(Th1)( ppp * dy(v) + fP * v ) + on(1, 2, 3, 22, 21, 23, u=0);
+    real[int] b2 = vRHS2(0, Xh);
+    u2[] = A2^-1 * b2;
+
+    // 3. 発散（div u）の計算
+    ppp[] = Bx * u1[]; 
+    ppp[] += By * u2[]; 
+
+    return ppp[];
+}
+
+// --- 6. 計算実行 ---
+p = 0; // 初期圧力
+LinearCG(divup, p[], eps=1.e-4, nbiter=100); // 収束計算
+divup(p[]); // 最終的な流速場の更新
+fespace UUh(Th,P0);
+UUh ux=0.,uy=0.,kappa=10.;
+
+    for (int i = 0; i < Th1.nt; i++) {
+    int reg = Th1[i].region;
+     if (reg == regMain) {
+        ux[][i] = u1[][i];
+        uy[][i] = u2[][i];
+    } 
+   }
+    for (int i = 0; i < Th1.nt; i++) {
+    int reg = Th1[i].region;
+     if (reg == regMain) {
+        kappa[][i] = 1.0;
+    } 
+   }
+plot(kappa,fill=true,wait=1);
+// 熱源設定
+real Qpower = 550.0;         //出力密度 [W/m^3] (例：50kW/m3)
+//real Q0 = Qpower / rhoCp;     //温度上昇率 [K/s]
+//real Vpump = 0.1;           //強制流速 [m/s]
+fespace VVh(Th,P1);
+VVh temp,tt;
+int n = 0;
+VVh fQ = ( (x >= rpipe && x < d) && (y >= S && y <= S+H1) ) ? Qpower : 0.0;
+
+solve dHeat (temp,tt,solver=Crout,init=n)
+    = int2d(Th)(
+      ux*dx(temp)*tt+uy*dy(temp)*tt+kappa*(dx(temp)*dx(tt)+dy(temp)*dy(tt)))
+      -int2d(Th)(fQ*tt)
+    + on(1, 2, temp=500)+on(3,temp=510)
+    ;
+
+// --- 7. 結果の表示 ---
+//plot(p, wait=1, value=true, coef=0.1, cmm="Stokes Flow (p)");
+plot([u1,u2], wait=1, coef=0.1, cmm="Stokes Flow (u)");
+plot(temp,fill=true,wait=1);
+ofstream f("ux.txt"); f << ux[];
+ofstream ff("uy.txt"); ff << uy[];
+ofstream fff("temp.txt"); fff << temp[];
+ofstream ffff("p.txt"); ffff << p[];
+// pressure
+//int[int] Order1 = [1];
+//string DataName1 = "p";
+//savevtk("p.vtk", Th1, p, dataname=DataName1, order=Order1);
+//// vector field
+//int[int] Order2 = [1];
+//string DataName2 = "u1u2";
+//savevtk("u1u2.vtk", Th, [u1,u2,0.0], dataname=DataName2, order=Order2);
+
